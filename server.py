@@ -1,5 +1,8 @@
 """
-🌐 Serwer API + Bot Telegram (Render) — WEBHOOK + lazy start w workerze
+🌐 Serwer API + Bot Telegram (Render)
+- WEBHOOK (bez Conflict)
+- Lazy start bota w workerze (działa z gunicornem)
+- Webhook zwraca 200 natychmiast, update w tle
 """
 
 import asyncio
@@ -21,7 +24,7 @@ from telegram.ext import (
 
 
 # ═══════════════════════════════════════════════════════════
-#  🔧 UZUPEŁNIJ PONIŻEJ — 6 WARTOŚCI
+#  🔧 UZUPEŁNIJ PONIŻEJ — 5 WARTOŚCI
 # ═══════════════════════════════════════════════════════════
 
 # 1) Token od @BotFather (ten sam co w main.py)
@@ -269,15 +272,18 @@ class BotRunner:
 
     def process_update_sync(self, update: Update):
         if not self.loop:
+            print("[BOT] loop is None — pomijam update", flush=True)
             return False
-        fut = asyncio.run_coroutine_threadsafe(
-            self.app.process_update(update), self.loop
-        )
         try:
-            fut.result(timeout=30)
+            kind = "callback" if update.callback_query else "message"
+            fut = asyncio.run_coroutine_threadsafe(
+                self.app.process_update(update), self.loop
+            )
+            fut.result(timeout=25)
+            print(f"[BOT] {kind} OK", flush=True)
             return True
         except Exception as e:
-            print(f"[BOT] process_update error: {e}", flush=True)
+            print(f"[BOT] process_update error: {type(e).__name__}: {e}", flush=True)
             return False
 
     async def _on_error(self, update, context):
@@ -378,6 +384,7 @@ class BotRunner:
         data = q.data or ""
         tid = q.from_user.id
 
+        # 1) Natychmiastowa odpowiedź — Telegram zamyka spinner, zanim baza zdąży odpowiedzieć
         try:
             await q.answer()
         except Exception as e:
@@ -388,9 +395,11 @@ class BotRunner:
             await q.message.reply_text("Najpierw /start")
             return
 
+        # ---- CLAIM ----
         if data.startswith("claim:"):
             task_id = int(data.split(":")[1])
             task = db_get_task(task_id)
+
             if not task or task["claimed_by"] is not None:
                 try:
                     await q.answer("❌ Ktoś już to przejął.", show_alert=True)
@@ -401,12 +410,14 @@ class BotRunner:
                 except Exception:
                     pass
                 return
+
             if db_get_active_claim(user["id"]):
                 try:
-                    await q.answer("❌ Masz już aktywne zlecenie.", show_alert=True)
+                    await q.answer("❌ Masz już aktywne zlecenie — najpierw je zakończ.", show_alert=True)
                 except Exception:
                     pass
                 return
+
             if not db_claim_task(task_id, user["id"]):
                 try:
                     await q.answer("❌ Spóźniłeś się.", show_alert=True)
@@ -414,38 +425,47 @@ class BotRunner:
                     pass
                 return
 
+            # Sukces — edytuj wiadomość zwycięzcy
             new_text = (q.message.text or "") + "\n\n✅ Przejęte przez Ciebie"
             kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton("📤 Oznacz jako zrealizowane", callback_data=f"complete:{task_id}")
             ]])
+
             edited = False
             try:
                 await q.edit_message_text(text=new_text, reply_markup=kb)
                 edited = True
+                print(f"[BOT] task {task_id}: edytowano wiadomość ✅", flush=True)
             except Exception as e:
-                print(f"[BOT] edit failed: {type(e).__name__}: {e}", flush=True)
+                print(f"[BOT] edit failed ({type(e).__name__}): {e}", flush=True)
+
             if not edited:
                 try:
                     await q.message.reply_text(
                         f"✅ Przejąłeś zlecenie #{task_id}.\nKliknij poniżej, gdy je wykonasz.",
                         reply_markup=kb,
                     )
+                    print(f"[BOT] task {task_id}: fallback — nowa wiadomość ✅", flush=True)
                 except Exception as e:
-                    print(f"[BOT] reply fallback failed: {e}", flush=True)
+                    print(f"[BOT] reply fallback też failed: {e}", flush=True)
+
+            # Zwolnij przyciski u innych userów
             await self._clear_claim_buttons(task_id, user["id"])
 
+        # ---- COMPLETE ----
         elif data.startswith("complete:"):
             task_id = int(data.split(":")[1])
             task = db_get_task(task_id)
             if not task or task["claimed_by"] != user["id"]:
                 try:
-                    await q.answer("❌ Nie jesteś właścicielem.", show_alert=True)
+                    await q.answer("❌ Nie jesteś właścicielem zlecenia.", show_alert=True)
                 except Exception:
                     pass
                 return
             self.pending[tid] = {"state": "awaiting_screenshot", "task_id": task_id}
             await q.message.reply_text("📸 Wyślij zrzut ekranu z balansu gwiazdek Telegram:")
 
+        # ---- CONFIRM YES ----
         elif data.startswith("cyes:"):
             task_id = int(data.split(":")[1])
             info = self.pending.get(tid)
@@ -458,10 +478,11 @@ class BotRunner:
             db_complete_task(task_id, info["screenshot_path"])
             self.pending.pop(tid, None)
             try:
-                await q.edit_message_text("✅ Zgłoszenie wysłane do administratora.")
+                await q.edit_message_text("✅ Zgłoszenie wysłane do administratora. Poczekaj na weryfikację.")
             except Exception:
                 pass
 
+        # ---- CONFIRM NO ----
         elif data.startswith("cno:"):
             task_id = int(data.split(":")[1])
             self.pending[tid] = {"state": "awaiting_screenshot", "task_id": task_id}
@@ -484,6 +505,7 @@ class BotRunner:
             except Exception:
                 pass
 
+    # ---------- WYSYŁKA I POWIADOMIENIA ----------
     def send_task_to_all(self, content):
         if not self.loop or not self.started:
             return 0
@@ -531,7 +553,7 @@ class BotRunner:
 
 
 # ═══════════════════════════════════════════════════════════
-#  API
+#  API (Flask)
 # ═══════════════════════════════════════════════════════════
 
 bot = BotRunner(BOT_TOKEN)
@@ -605,24 +627,39 @@ def notify():
 
 @app.route(f"/webhook/{WEBHOOK_SECRET}", methods=["POST"])
 def webhook():
+    # 1) Weryfikacja sekretu — szybko, bez bazy
     if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
         return "forbidden", 403
 
-    ensure_bot_running()
-
+    # 2) Natychmiast 200 OK — Telegram nie ponowi
     try:
         data = request.get_json(force=True)
-        if not bot.app:
-            return "not ready", 503
-        update = Update.de_json(data, bot.app.bot)
-        bot.process_update_sync(update)
-    except Exception as e:
-        print(f"[WEBHOOK ERR] {e}", flush=True)
+    except Exception:
+        return "bad json", 400
+
+    # 3) W tle: budzenie bota (jeśli trzeba) + przetworzenie update
+    threading.Thread(
+        target=_handle_update_bg, args=(data,), daemon=True
+    ).start()
+
     return "ok", 200
 
 
+def _handle_update_bg(data):
+    """Wykonuje się w tle — nie blokuje odpowiedzi webhooka."""
+    try:
+        ensure_bot_running()
+        if not bot.app:
+            print("[WEBHOOK] bot.app is None, update pominięty", flush=True)
+            return
+        update = Update.de_json(data, bot.app.bot)
+        bot.process_update_sync(update)
+    except Exception as e:
+        print(f"[WEBHOOK BG ERR] {type(e).__name__}: {e}", flush=True)
+
+
 # ═══════════════════════════════════════════════════════════
-#  START (nic nie robimy tu — bot startuje leniwie)
+#  START (bot startuje leniwie przy pierwszym żądaniu)
 # ═══════════════════════════════════════════════════════════
 
 print("=== START SERVER.PY (WEBHOOK) ===", flush=True)
