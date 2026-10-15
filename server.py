@@ -1,15 +1,24 @@
 """
-🌐 Serwer API dla Nadawcy Zleceń — wersja dla Render (PostgreSQL)
+🌐 Serwer API + Bot Telegram (jeden plik dla Render)
 """
 
+import asyncio
 import json
 import os
+import re
+import threading
 from datetime import datetime
 
 import psycopg2
 import psycopg2.extras
 import requests
 from flask import Flask, request, jsonify
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, filters, ContextTypes,
+)
 
 
 # ═══════════════════════════════════════════════════════════
@@ -28,17 +37,26 @@ API_KEY_DEFAULT = "4918-8544-5214-22"
 # ═══════════════════════════════════════════════════════════
 
 
-# Render nadpisze te wartości ze zmiennych środowiskowych
 BOT_TOKEN = os.environ.get("BOT_TOKEN", BOT_TOKEN_DEFAULT)
 DATABASE_URL = os.environ.get("DATABASE_URL", DATABASE_URL_DEFAULT)
 API_KEY = os.environ.get("API_KEY", API_KEY_DEFAULT)
 
+SCREENSHOTS_DIR = "screenshots"
+IDENTIFIER_REGEX = r"^[0-9A-Za-z]{5}$"
 
 app = Flask(__name__)
 
 
+# ═══════════════════════════════════════════════════════════
+#  BAZA DANYCH
+# ═══════════════════════════════════════════════════════════
+
 def db():
     return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+
+def db_cursor(conn):
+    return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
 
 def init_db():
@@ -73,28 +91,424 @@ def init_db():
             """)
 
 
+# ── Shortcut-y bazodanowe ──
+
+def db_get_user_by_tid(tid):
+    with db() as conn:
+        with db_cursor(conn) as cur:
+            cur.execute("SELECT * FROM users WHERE telegram_id = %s", (tid,))
+            return cur.fetchone()
+
+
+def db_get_user_by_identifier(ident):
+    with db() as conn:
+        with db_cursor(conn) as cur:
+            cur.execute("SELECT * FROM users WHERE identifier = %s", (ident,))
+            return cur.fetchone()
+
+
+def db_get_user_by_id(uid):
+    with db() as conn:
+        with db_cursor(conn) as cur:
+            cur.execute("SELECT * FROM users WHERE id = %s", (uid,))
+            return cur.fetchone()
+
+
+def db_get_task(tid):
+    with db() as conn:
+        with db_cursor(conn) as cur:
+            cur.execute("SELECT * FROM tasks WHERE id = %s", (tid,))
+            return cur.fetchone()
+
+
+def db_get_active_users():
+    with db() as conn:
+        with db_cursor(conn) as cur:
+            cur.execute("SELECT * FROM users WHERE telegram_id IS NOT NULL AND eth_address IS NOT NULL")
+            return cur.fetchall()
+
+
+def db_link_user(identifier, telegram_id, eth):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET telegram_id = %s, eth_address = %s WHERE identifier = %s",
+                (telegram_id, eth, identifier),
+            )
+
+
+def db_update_user_eth(tid, eth):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET eth_address = %s WHERE telegram_id = %s", (eth, tid))
+
+
+def db_create_task(content):
+    with db() as conn:
+        with db_cursor(conn) as cur:
+            cur.execute(
+                "INSERT INTO tasks (content, created_at) VALUES (%s, %s) RETURNING id",
+                (content, datetime.now()),
+            )
+            return cur.fetchone()["id"]
+
+
+def db_claim_task(task_id, user_id):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE tasks SET claimed_by = %s, status = 'claimed' "
+                "WHERE id = %s AND claimed_by IS NULL",
+                (user_id, task_id),
+            )
+            return cur.rowcount > 0
+
+
+def db_get_active_claim(user_id):
+    with db() as conn:
+        with db_cursor(conn) as cur:
+            cur.execute(
+                "SELECT * FROM tasks WHERE claimed_by = %s AND "
+                "(status = 'claimed' OR (status = 'completed' AND approved = 0))",
+                (user_id,),
+            )
+            return cur.fetchone()
+
+
+def db_complete_task(task_id, screenshot_path):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE tasks SET status = 'completed', screenshot_path = %s, "
+                "completed_at = %s WHERE id = %s",
+                (screenshot_path, datetime.now(), task_id),
+            )
+
+
+def db_save_user_message(user_id, task_id, message_id, chat_id):
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO user_messages (user_id, task_id, message_id, chat_id) "
+                "VALUES (%s, %s, %s, %s)",
+                (user_id, task_id, message_id, chat_id),
+            )
+
+
+def db_get_user_messages(task_id):
+    with db() as conn:
+        with db_cursor(conn) as cur:
+            cur.execute("SELECT * FROM user_messages WHERE task_id = %s", (task_id,))
+            return cur.fetchall()
+
+
+# ═══════════════════════════════════════════════════════════
+#  BOT TELEGRAM
+# ═══════════════════════════════════════════════════════════
+
+class BotRunner:
+    def __init__(self, token):
+        self.token = token
+        self.loop = None
+        self.app = None
+        self.pending = {}
+        self.started = False
+        self.failed = False
+        self._thread = None
+
+    def start_in_thread(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        try:
+            self.loop.run_until_complete(self._async_main())
+        except Exception as e:
+            self.failed = True
+            print(f"[BOT] FATAL: {e}")
+            import traceback
+            traceback.print_exc()
+
+    async def _async_main(self):
+        self.app = Application.builder().token(self.token).build()
+        self.app.add_handler(CommandHandler("start", self.cmd_start))
+        self.app.add_handler(CallbackQueryHandler(self.on_callback))
+        self.app.add_handler(MessageHandler(filters.PHOTO, self.on_photo))
+        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
+        self.app.add_error_handler(self._on_error)
+
+        await self.app.initialize()
+        await self.app.start()
+        await self.app.updater.start_polling()
+        self.started = True
+        print("[BOT] Uruchomiony i nasłuchuje...")
+        self._stop_event = asyncio.Event()
+        await self._stop_event.wait()
+
+    async def _on_error(self, update, context):
+        err = context.error
+        print(f"[BOT] handler error: {type(err).__name__}: {err}")
+        try:
+            if update and update.callback_query:
+                await update.callback_query.answer()
+        except Exception:
+            pass
+
+    # ---------- /start ----------
+    async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        tid = update.effective_user.id
+        user = db_get_user_by_tid(tid)
+        if user and user["eth_address"]:
+            await update.message.reply_text("✅ Masz już pełny dostęp do bota.")
+            return
+        if user:
+            self.pending[tid] = {"state": "awaiting_eth"}
+            await update.message.reply_text("Podaj swój adres Ethereum (0x...):")
+            return
+        self.pending[tid] = {"state": "awaiting_id"}
+        await update.message.reply_text(
+            "👋 Witaj!\nPodaj swój 5-znakowy identyfikator (format np. `00a01`):",
+            parse_mode="Markdown",
+        )
+
+    # ---------- TEXT ----------
+    async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        tid = update.effective_user.id
+        text = (update.message.text or "").strip()
+        if tid not in self.pending:
+            return
+        state = self.pending[tid].get("state")
+
+        if state == "awaiting_id":
+            if not re.match(IDENTIFIER_REGEX, text):
+                await update.message.reply_text(
+                    "❌ Nieprawidłowy format. Wymagany: 5 znaków alfanumerycznych (np. `00a01`).",
+                    parse_mode="Markdown",
+                )
+                return
+            acc = db_get_user_by_identifier(text)
+            if not acc:
+                await update.message.reply_text("❌ Nieznany identyfikator.")
+                return
+            if acc["telegram_id"] and acc["telegram_id"] != tid:
+                await update.message.reply_text("❌ Ten identyfikator jest już przypisany.")
+                return
+            self.pending[tid] = {"state": "awaiting_eth", "identifier": text}
+            await update.message.reply_text("✅ Identyfikator OK! Teraz podaj adres Ethereum (0x..., 42 znaki):")
+
+        elif state == "awaiting_eth":
+            if not (text.startswith("0x") and len(text) == 42):
+                await update.message.reply_text(
+                    "❌ Adres musi zaczynać się od `0x` i mieć 42 znaki.",
+                    parse_mode="Markdown",
+                )
+                return
+            ident = self.pending[tid]["identifier"]
+            existing = db_get_user_by_tid(tid)
+            if existing:
+                db_update_user_eth(tid, text)
+            else:
+                db_link_user(ident, tid, text)
+            self.pending.pop(tid, None)
+            await update.message.reply_text("🎉 Konto aktywowane! Otrzymasz zlecenia, gdy tylko się pojawią.")
+
+        elif state == "awaiting_screenshot":
+            await update.message.reply_text("📸 Wyślij zrzut ekranu (zdjęcie), nie tekst.")
+
+    # ---------- PHOTO ----------
+    async def on_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        tid = update.effective_user.id
+        if tid not in self.pending or self.pending[tid].get("state") != "awaiting_screenshot":
+            return
+
+        task_id = self.pending[tid]["task_id"]
+        photo = update.message.photo[-1]
+        tg_file = await photo.get_file()
+
+        os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
+        path = os.path.join(SCREENSHOTS_DIR, f"task_{task_id}_{tid}.jpg")
+        await tg_file.download_to_drive(path)
+
+        self.pending[tid] = {
+            "state": "awaiting_confirm",
+            "task_id": task_id,
+            "screenshot_path": path,
+        }
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Tak", callback_data=f"cyes:{task_id}"),
+            InlineKeyboardButton("❌ Nie", callback_data=f"cno:{task_id}"),
+        ]])
+        await update.message.reply_text("Czy potwierdzasz wykonanie tego zlecenia?", reply_markup=kb)
+
+    # ---------- CALLBACKS ----------
+    async def on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        q = update.callback_query
+        data = q.data or ""
+        tid = q.from_user.id
+
+        try:
+            await q.answer()
+        except Exception as e:
+            print(f"[TG] answer initial failed: {e}")
+
+        user = db_get_user_by_tid(tid)
+        if not user:
+            await q.message.reply_text("Najpierw /start")
+            return
+
+        # CLAIM
+        if data.startswith("claim:"):
+            task_id = int(data.split(":")[1])
+            task = db_get_task(task_id)
+            if not task or task["claimed_by"] is not None:
+                try:
+                    await q.answer("❌ Ktoś już to przejął.", show_alert=True)
+                except Exception:
+                    pass
+                try:
+                    await q.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+                return
+            if db_get_active_claim(user["id"]):
+                try:
+                    await q.answer("❌ Masz już aktywne zlecenie.", show_alert=True)
+                except Exception:
+                    pass
+                return
+            if not db_claim_task(task_id, user["id"]):
+                try:
+                    await q.answer("❌ Spóźniłeś się.", show_alert=True)
+                except Exception:
+                    pass
+                return
+
+            new_text = (q.message.text or "") + "\n\n✅ Przejęte przez Ciebie"
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("📤 Oznacz jako zrealizowane", callback_data=f"complete:{task_id}")
+            ]])
+
+            edited = False
+            try:
+                await q.edit_message_text(text=new_text, reply_markup=kb)
+                edited = True
+            except Exception as e:
+                print(f"[BOT] edit failed: {type(e).__name__}: {e}")
+
+            if not edited:
+                try:
+                    await q.message.reply_text(
+                        f"✅ Przejąłeś zlecenie #{task_id}.\nKliknij poniżej, gdy je wykonasz.",
+                        reply_markup=kb,
+                    )
+                except Exception as e:
+                    print(f"[BOT] reply fallback failed: {e}")
+
+            await self._clear_claim_buttons(task_id, user["id"])
+
+        # COMPLETE
+        elif data.startswith("complete:"):
+            task_id = int(data.split(":")[1])
+            task = db_get_task(task_id)
+            if not task or task["claimed_by"] != user["id"]:
+                try:
+                    await q.answer("❌ Nie jesteś właścicielem.", show_alert=True)
+                except Exception:
+                    pass
+                return
+            self.pending[tid] = {"state": "awaiting_screenshot", "task_id": task_id}
+            await q.message.reply_text("📸 Wyślij zrzut ekranu z balansu gwiazdek Telegram:")
+
+        # CONFIRM YES
+        elif data.startswith("cyes:"):
+            task_id = int(data.split(":")[1])
+            info = self.pending.get(tid)
+            if not info or info.get("task_id") != task_id or info.get("state") != "awaiting_confirm":
+                try:
+                    await q.answer("Brak kontekstu.", show_alert=True)
+                except Exception:
+                    pass
+                return
+            db_complete_task(task_id, info["screenshot_path"])
+            self.pending.pop(tid, None)
+            try:
+                await q.edit_message_text("✅ Zgłoszenie wysłane do administratora.")
+            except Exception:
+                pass
+
+        # CONFIRM NO
+        elif data.startswith("cno:"):
+            task_id = int(data.split(":")[1])
+            self.pending[tid] = {"state": "awaiting_screenshot", "task_id": task_id}
+            try:
+                await q.edit_message_text("OK — wyślij ponownie zrzut ekranu:")
+            except Exception:
+                pass
+
+    async def _clear_claim_buttons(self, task_id, claimed_user_id):
+        task = db_get_task(task_id)
+        messages = db_get_user_messages(task_id)
+        claimed_user = db_get_user_by_id(task["claimed_by"])
+        for m in messages:
+            if claimed_user and m["chat_id"] == claimed_user["telegram_id"]:
+                continue
+            try:
+                await self.app.bot.edit_message_reply_markup(
+                    chat_id=m["chat_id"], message_id=m["message_id"], reply_markup=None
+                )
+            except Exception:
+                pass
+
+    def send_task_to_all(self, content):
+        """Wywoływane z API. Wysyła zlecenie do wszystkich."""
+        if not self.loop or not self.started:
+            return 0
+        fut = asyncio.run_coroutine_threadsafe(self._send_task(content), self.loop)
+        try:
+            return fut.result(timeout=60)
+        except Exception as e:
+            print(f"[BOT] send_task error: {e}")
+            return 0
+
+    async def _send_task(self, content):
+        users = db_get_active_users()
+        if not users:
+            return 0
+        task_id = db_create_task(content)
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ CLAIM", callback_data=f"claim:{task_id}")
+        ]])
+        sent = 0
+        for u in users:
+            try:
+                msg = await self.app.bot.send_message(
+                    chat_id=u["telegram_id"],
+                    text=f"🆕 Nowe Zlecenie: {content}",
+                    reply_markup=kb,
+                )
+                db_save_user_message(u["id"], task_id, msg.message_id, u["telegram_id"])
+                sent += 1
+            except Exception as e:
+                print(f"[BOT] nie wysłano do {u['telegram_id']}: {e}")
+        return sent
+
+
+# ═══════════════════════════════════════════════════════════
+#  API (Flask)
+# ═══════════════════════════════════════════════════════════
+
+bot = BotRunner(BOT_TOKEN)
+
+
 def _check_key():
     return request.headers.get("X-API-Key") == API_KEY
 
 
-def _send_tg(chat_id, text, task_id):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    r = requests.post(url, json={
-        "chat_id": chat_id,
-        "text": text,
-        "reply_markup": json.dumps({
-            "inline_keyboard": [[
-                {"text": "✅ CLAIM", "callback_data": f"claim:{task_id}"}
-            ]]
-        }),
-    }, timeout=15)
-    r.raise_for_status()
-    return r.json()["result"]["message_id"]
-
-
 @app.route("/ping")
 def ping():
-    return jsonify({"ok": True, "service": "task-sender"})
+    return jsonify({"ok": True, "service": "task-sender", "bot_started": bot.started})
 
 
 @app.route("/send", methods=["POST"])
@@ -107,41 +521,26 @@ def send():
     if not content:
         return jsonify({"ok": False, "error": "empty content"}), 400
 
-    with db() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            cur.execute(
-                "INSERT INTO tasks (content, created_at) VALUES (%s, %s) RETURNING id",
-                (content, datetime.now()),
-            )
-            task_id = cur.fetchone()["id"]
+    if not bot.started:
+        return jsonify({"ok": False, "error": "bot not ready"}), 503
 
-            cur.execute(
-                "SELECT * FROM users WHERE telegram_id IS NOT NULL AND eth_address IS NOT NULL"
-            )
-            users = cur.fetchall()
+    sent = bot.send_task_to_all(content)
+    return jsonify({"ok": True, "sent": sent})
 
-            sent = 0
-            for u in users:
-                try:
-                    mid = _send_tg(u["telegram_id"], f"🆕 Nowe Zlecenie: {content}", task_id)
-                    cur.execute(
-                        "INSERT INTO user_messages (user_id, task_id, message_id, chat_id) "
-                        "VALUES (%s, %s, %s, %s)",
-                        (u["id"], task_id, mid, u["telegram_id"]),
-                    )
-                    sent += 1
-                except Exception as e:
-                    print(f"[TG ERR] {u['identifier']}: {e}")
 
-            conn.commit()
-            return jsonify({"ok": True, "task_id": task_id, "sent": sent, "total": len(users)})
-
+# ═══════════════════════════════════════════════════════════
+#  START
+# ═══════════════════════════════════════════════════════════
 
 try:
     init_db()
     print("[OK] Baza zainicjalizowana.")
 except Exception as e:
     print(f"[DB INIT ERR] {e}")
+
+# Start bota w tle (razem z Flask)
+bot.start_in_thread()
+print("[OK] Bot startuje w tle...")
 
 
 if __name__ == "__main__":
