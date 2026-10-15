@@ -1,11 +1,12 @@
 """
-🌐 Serwer API + Bot Telegram (Render) — wersja WEBHOOK
+🌐 Serwer API + Bot Telegram (Render) — WEBHOOK + lazy start w workerze
 """
 
 import asyncio
 import os
 import re
 import threading
+import time
 from datetime import datetime
 
 import psycopg2
@@ -20,7 +21,7 @@ from telegram.ext import (
 
 
 # ═══════════════════════════════════════════════════════════
-#  🔧 UZUPEŁNIJ PONIŻEJ — 3 WARTOŚCI
+#  🔧 UZUPEŁNIJ PONIŻEJ — 6 WARTOŚCI
 # ═══════════════════════════════════════════════════════════
 
 # 1) Token od @BotFather (ten sam co w main.py)
@@ -267,7 +268,6 @@ class BotRunner:
         await self._stop_event.wait()
 
     def process_update_sync(self, update: Update):
-        """Wywoływane z Flaska (inny wątek) — wrzuca update do pętli bota."""
         if not self.loop:
             return False
         fut = asyncio.run_coroutine_threadsafe(
@@ -516,12 +516,42 @@ class BotRunner:
                 print(f"[BOT] nie wysłano do {u['telegram_id']}: {e}", flush=True)
         return sent
 
+    def notify_one(self, telegram_id, text):
+        if not self.loop or not self.started:
+            return False
+        fut = asyncio.run_coroutine_threadsafe(
+            self.app.bot.send_message(chat_id=telegram_id, text=text), self.loop
+        )
+        try:
+            fut.result(timeout=15)
+            return True
+        except Exception as e:
+            print(f"[BOT] notify error: {e}", flush=True)
+            return False
+
 
 # ═══════════════════════════════════════════════════════════
 #  API
 # ═══════════════════════════════════════════════════════════
 
 bot = BotRunner(BOT_TOKEN)
+_bot_lock = threading.Lock()
+
+
+def ensure_bot_running():
+    """Uruchamia bota leniwie — w tym samym procesie, który obsługuje żądania."""
+    if bot.started or bot.failed:
+        return
+    with _bot_lock:
+        if bot.started or bot.failed:
+            return
+        print("[BOT] Lazy start (in worker process)...", flush=True)
+        bot.start_in_thread()
+        for _ in range(200):   # max 20s
+            if bot.started or bot.failed:
+                break
+            time.sleep(0.1)
+        print(f"[BOT] Lazy start done. started={bot.started}, failed={bot.failed}", flush=True)
 
 
 def _check_key():
@@ -530,6 +560,7 @@ def _check_key():
 
 @app.route("/ping")
 def ping():
+    ensure_bot_running()
     return jsonify({"ok": True, "service": "task-sender", "bot_started": bot.started})
 
 
@@ -537,6 +568,8 @@ def ping():
 def send():
     if not _check_key():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    ensure_bot_running()
 
     data = request.get_json(force=True) or {}
     content = (data.get("content") or "").strip()
@@ -550,11 +583,33 @@ def send():
     return jsonify({"ok": True, "sent": sent})
 
 
+@app.route("/notify", methods=["POST"])
+def notify():
+    if not _check_key():
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    ensure_bot_running()
+
+    data = request.get_json(force=True) or {}
+    tid = data.get("telegram_id")
+    text = data.get("text")
+    if not tid or not text:
+        return jsonify({"ok": False, "error": "missing fields"}), 400
+
+    if not bot.started:
+        return jsonify({"ok": False, "error": "bot not ready"}), 503
+
+    ok = bot.notify_one(tid, text)
+    return jsonify({"ok": ok})
+
+
 @app.route(f"/webhook/{WEBHOOK_SECRET}", methods=["POST"])
 def webhook():
-    # Telegram weryfikuje sekret nagłówkiem
     if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
         return "forbidden", 403
+
+    ensure_bot_running()
+
     try:
         data = request.get_json(force=True)
         if not bot.app:
@@ -567,7 +622,7 @@ def webhook():
 
 
 # ═══════════════════════════════════════════════════════════
-#  START
+#  START (nic nie robimy tu — bot startuje leniwie)
 # ═══════════════════════════════════════════════════════════
 
 print("=== START SERVER.PY (WEBHOOK) ===", flush=True)
@@ -581,10 +636,7 @@ except Exception as e:
 print(f"[..] BOT_TOKEN długość: {len(BOT_TOKEN)}", flush=True)
 print(f"[..] WEBHOOK_BASE_URL: {WEBHOOK_BASE_URL}", flush=True)
 print(f"[..] WEBHOOK path: /webhook/{WEBHOOK_SECRET}", flush=True)
-
-print("[..] Startuję wątek bota...", flush=True)
-bot.start_in_thread()
-print("[OK] Wątek bota uruchomiony.", flush=True)
+print("[..] Bot uruchomi się leniwie przy pierwszym żądaniu.", flush=True)
 
 
 if __name__ == "__main__":
