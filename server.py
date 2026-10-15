@@ -1,9 +1,8 @@
 """
-🌐 Serwer API + Bot Telegram (Render)
+🌐 Serwer API + Bot Telegram (Render) — wersja WEBHOOK
 """
 
 import asyncio
-import json
 import os
 import re
 import threading
@@ -11,7 +10,6 @@ from datetime import datetime
 
 import psycopg2
 import psycopg2.extras
-import requests
 from flask import Flask, request, jsonify
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -34,12 +32,20 @@ DATABASE_URL_DEFAULT = "postgresql://neondb_owner:npg_LIRp8qMU1NzB@ep-aged-bonus
 # 3) Twój tajny klucz API — wymyśl dowolny długi ciąg znaków
 API_KEY_DEFAULT = "4918-8544-5214-22"
 
+# Sekret webhooka — wymyśl losowy ciąg np. "x9k2m4p7q1" (bez znaków specjalnych)
+WEBHOOK_SECRET_DEFAULT = "9574246-653453"
+
+# Publiczny URL Twojego serwisu Render (bez / na końcu)
+WEBHOOK_BASE_URL_DEFAULT = "https://zlecenia-api.onrender.com"
+
 # ═══════════════════════════════════════════════════════════
 
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", BOT_TOKEN_DEFAULT)
 DATABASE_URL = os.environ.get("DATABASE_URL", DATABASE_URL_DEFAULT)
 API_KEY = os.environ.get("API_KEY", API_KEY_DEFAULT)
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", WEBHOOK_SECRET_DEFAULT)
+WEBHOOK_BASE_URL = os.environ.get("WEBHOOK_BASE_URL", WEBHOOK_BASE_URL_DEFAULT)
 
 SCREENSHOTS_DIR = "screenshots"
 IDENTIFIER_REGEX = r"^[0-9A-Za-z]{5}$"
@@ -201,7 +207,7 @@ def db_get_user_messages(task_id):
 
 
 # ═══════════════════════════════════════════════════════════
-#  BOT
+#  BOT (WEBHOOK)
 # ═══════════════════════════════════════════════════════════
 
 class BotRunner:
@@ -223,7 +229,6 @@ class BotRunner:
         try:
             self.loop = asyncio.new_event_loop()
             asyncio.set_event_loop(self.loop)
-            print("[BOT] event loop utworzony", flush=True)
             self.loop.run_until_complete(self._async_main())
         except Exception as e:
             self.failed = True
@@ -232,29 +237,48 @@ class BotRunner:
             traceback.print_exc()
 
     async def _async_main(self):
-        print("[BOT] 1/6 Buduję Application...", flush=True)
+        print("[BOT] 1/5 Buduję Application...", flush=True)
         self.app = Application.builder().token(self.token).build()
 
-        print("[BOT] 2/6 Rejestruję handlery...", flush=True)
+        print("[BOT] 2/5 Rejestruję handlery...", flush=True)
         self.app.add_handler(CommandHandler("start", self.cmd_start))
         self.app.add_handler(CallbackQueryHandler(self.on_callback))
         self.app.add_handler(MessageHandler(filters.PHOTO, self.on_photo))
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
         self.app.add_error_handler(self._on_error)
 
-        print("[BOT] 3/6 initialize()...", flush=True)
+        print("[BOT] 3/5 initialize()...", flush=True)
         await self.app.initialize()
 
-        print("[BOT] 4/6 start()...", flush=True)
+        print("[BOT] 4/5 start()...", flush=True)
         await self.app.start()
 
-        print("[BOT] 5/6 start_polling()...", flush=True)
-        await self.app.updater.start_polling()
+        webhook_url = f"{WEBHOOK_BASE_URL}/webhook/{WEBHOOK_SECRET}"
+        print(f"[BOT] 5/5 set_webhook → {webhook_url}", flush=True)
+        await self.app.bot.set_webhook(
+            url=webhook_url,
+            secret_token=WEBHOOK_SECRET,
+            drop_pending_updates=True,
+        )
 
-        print("[BOT] 6/6 ✅ Polling aktywny — bot nasłuchuje.", flush=True)
+        print("[BOT] ✅ Webhook ustawiony — bot gotowy.", flush=True)
         self.started = True
         self._stop_event = asyncio.Event()
         await self._stop_event.wait()
+
+    def process_update_sync(self, update: Update):
+        """Wywoływane z Flaska (inny wątek) — wrzuca update do pętli bota."""
+        if not self.loop:
+            return False
+        fut = asyncio.run_coroutine_threadsafe(
+            self.app.process_update(update), self.loop
+        )
+        try:
+            fut.result(timeout=30)
+            return True
+        except Exception as e:
+            print(f"[BOT] process_update error: {e}", flush=True)
+            return False
 
     async def _on_error(self, update, context):
         err = context.error
@@ -265,6 +289,7 @@ class BotRunner:
         except Exception:
             pass
 
+    # ---------- HANDLERY ----------
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         tid = update.effective_user.id
         user = db_get_user_by_tid(tid)
@@ -363,7 +388,6 @@ class BotRunner:
             await q.message.reply_text("Najpierw /start")
             return
 
-        # CLAIM
         if data.startswith("claim:"):
             task_id = int(data.split(":")[1])
             task = db_get_task(task_id)
@@ -394,14 +418,12 @@ class BotRunner:
             kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton("📤 Oznacz jako zrealizowane", callback_data=f"complete:{task_id}")
             ]])
-
             edited = False
             try:
                 await q.edit_message_text(text=new_text, reply_markup=kb)
                 edited = True
             except Exception as e:
                 print(f"[BOT] edit failed: {type(e).__name__}: {e}", flush=True)
-
             if not edited:
                 try:
                     await q.message.reply_text(
@@ -410,10 +432,8 @@ class BotRunner:
                     )
                 except Exception as e:
                     print(f"[BOT] reply fallback failed: {e}", flush=True)
-
             await self._clear_claim_buttons(task_id, user["id"])
 
-        # COMPLETE
         elif data.startswith("complete:"):
             task_id = int(data.split(":")[1])
             task = db_get_task(task_id)
@@ -426,7 +446,6 @@ class BotRunner:
             self.pending[tid] = {"state": "awaiting_screenshot", "task_id": task_id}
             await q.message.reply_text("📸 Wyślij zrzut ekranu z balansu gwiazdek Telegram:")
 
-        # CONFIRM YES
         elif data.startswith("cyes:"):
             task_id = int(data.split(":")[1])
             info = self.pending.get(tid)
@@ -443,7 +462,6 @@ class BotRunner:
             except Exception:
                 pass
 
-        # CONFIRM NO
         elif data.startswith("cno:"):
             task_id = int(data.split(":")[1])
             self.pending[tid] = {"state": "awaiting_screenshot", "task_id": task_id}
@@ -532,11 +550,27 @@ def send():
     return jsonify({"ok": True, "sent": sent})
 
 
+@app.route(f"/webhook/{WEBHOOK_SECRET}", methods=["POST"])
+def webhook():
+    # Telegram weryfikuje sekret nagłówkiem
+    if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
+        return "forbidden", 403
+    try:
+        data = request.get_json(force=True)
+        if not bot.app:
+            return "not ready", 503
+        update = Update.de_json(data, bot.app.bot)
+        bot.process_update_sync(update)
+    except Exception as e:
+        print(f"[WEBHOOK ERR] {e}", flush=True)
+    return "ok", 200
+
+
 # ═══════════════════════════════════════════════════════════
 #  START
 # ═══════════════════════════════════════════════════════════
 
-print("=== START SERVER.PY ===", flush=True)
+print("=== START SERVER.PY (WEBHOOK) ===", flush=True)
 
 try:
     init_db()
@@ -544,8 +578,9 @@ try:
 except Exception as e:
     print(f"[DB INIT ERR] {e}", flush=True)
 
-print(f"[..] BOT_TOKEN długość: {len(BOT_TOKEN)}, początek: {BOT_TOKEN[:8]}...", flush=True)
-print(f"[..] DATABASE_URL początek: {DATABASE_URL[:25]}...", flush=True)
+print(f"[..] BOT_TOKEN długość: {len(BOT_TOKEN)}", flush=True)
+print(f"[..] WEBHOOK_BASE_URL: {WEBHOOK_BASE_URL}", flush=True)
+print(f"[..] WEBHOOK path: /webhook/{WEBHOOK_SECRET}", flush=True)
 
 print("[..] Startuję wątek bota...", flush=True)
 bot.start_in_thread()
