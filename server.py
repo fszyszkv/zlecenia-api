@@ -1,5 +1,5 @@
 """
-🌐 Serwer API + Bot Telegram (jeden plik dla Render)
+🌐 Serwer API + Bot Telegram (Render)
 """
 
 import asyncio
@@ -48,7 +48,7 @@ app = Flask(__name__)
 
 
 # ═══════════════════════════════════════════════════════════
-#  BAZA DANYCH
+#  BAZA
 # ═══════════════════════════════════════════════════════════
 
 def db():
@@ -90,8 +90,6 @@ def init_db():
                 );
             """)
 
-
-# ── Shortcut-y bazodanowe ──
 
 def db_get_user_by_tid(tid):
     with db() as conn:
@@ -203,7 +201,7 @@ def db_get_user_messages(task_id):
 
 
 # ═══════════════════════════════════════════════════════════
-#  BOT TELEGRAM
+#  BOT
 # ═══════════════════════════════════════════════════════════
 
 class BotRunner:
@@ -221,42 +219,52 @@ class BotRunner:
         self._thread.start()
 
     def _run(self):
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
+        print("[BOT] _run() start", flush=True)
         try:
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+            print("[BOT] event loop utworzony", flush=True)
             self.loop.run_until_complete(self._async_main())
         except Exception as e:
             self.failed = True
-            print(f"[BOT] FATAL: {e}")
+            print(f"[BOT] FATAL: {type(e).__name__}: {e}", flush=True)
             import traceback
             traceback.print_exc()
 
     async def _async_main(self):
+        print("[BOT] 1/6 Buduję Application...", flush=True)
         self.app = Application.builder().token(self.token).build()
+
+        print("[BOT] 2/6 Rejestruję handlery...", flush=True)
         self.app.add_handler(CommandHandler("start", self.cmd_start))
         self.app.add_handler(CallbackQueryHandler(self.on_callback))
         self.app.add_handler(MessageHandler(filters.PHOTO, self.on_photo))
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
         self.app.add_error_handler(self._on_error)
 
+        print("[BOT] 3/6 initialize()...", flush=True)
         await self.app.initialize()
+
+        print("[BOT] 4/6 start()...", flush=True)
         await self.app.start()
+
+        print("[BOT] 5/6 start_polling()...", flush=True)
         await self.app.updater.start_polling()
+
+        print("[BOT] 6/6 ✅ Polling aktywny — bot nasłuchuje.", flush=True)
         self.started = True
-        print("[BOT] Uruchomiony i nasłuchuje...")
         self._stop_event = asyncio.Event()
         await self._stop_event.wait()
 
     async def _on_error(self, update, context):
         err = context.error
-        print(f"[BOT] handler error: {type(err).__name__}: {err}")
+        print(f"[BOT] handler error: {type(err).__name__}: {err}", flush=True)
         try:
             if update and update.callback_query:
                 await update.callback_query.answer()
         except Exception:
             pass
 
-    # ---------- /start ----------
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         tid = update.effective_user.id
         user = db_get_user_by_tid(tid)
@@ -273,7 +281,6 @@ class BotRunner:
             parse_mode="Markdown",
         )
 
-    # ---------- TEXT ----------
     async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         tid = update.effective_user.id
         text = (update.message.text or "").strip()
@@ -317,7 +324,6 @@ class BotRunner:
         elif state == "awaiting_screenshot":
             await update.message.reply_text("📸 Wyślij zrzut ekranu (zdjęcie), nie tekst.")
 
-    # ---------- PHOTO ----------
     async def on_photo(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         tid = update.effective_user.id
         if tid not in self.pending or self.pending[tid].get("state") != "awaiting_screenshot":
@@ -342,7 +348,6 @@ class BotRunner:
         ]])
         await update.message.reply_text("Czy potwierdzasz wykonanie tego zlecenia?", reply_markup=kb)
 
-    # ---------- CALLBACKS ----------
     async def on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
         data = q.data or ""
@@ -351,7 +356,7 @@ class BotRunner:
         try:
             await q.answer()
         except Exception as e:
-            print(f"[TG] answer initial failed: {e}")
+            print(f"[TG] answer initial failed: {e}", flush=True)
 
         user = db_get_user_by_tid(tid)
         if not user:
@@ -395,7 +400,7 @@ class BotRunner:
                 await q.edit_message_text(text=new_text, reply_markup=kb)
                 edited = True
             except Exception as e:
-                print(f"[BOT] edit failed: {type(e).__name__}: {e}")
+                print(f"[BOT] edit failed: {type(e).__name__}: {e}", flush=True)
 
             if not edited:
                 try:
@@ -404,7 +409,7 @@ class BotRunner:
                         reply_markup=kb,
                     )
                 except Exception as e:
-                    print(f"[BOT] reply fallback failed: {e}")
+                    print(f"[BOT] reply fallback failed: {e}", flush=True)
 
             await self._clear_claim_buttons(task_id, user["id"])
 
@@ -462,14 +467,13 @@ class BotRunner:
                 pass
 
     def send_task_to_all(self, content):
-        """Wywoływane z API. Wysyła zlecenie do wszystkich."""
         if not self.loop or not self.started:
             return 0
         fut = asyncio.run_coroutine_threadsafe(self._send_task(content), self.loop)
         try:
             return fut.result(timeout=60)
         except Exception as e:
-            print(f"[BOT] send_task error: {e}")
+            print(f"[BOT] send_task error: {e}", flush=True)
             return 0
 
     async def _send_task(self, content):
@@ -491,12 +495,12 @@ class BotRunner:
                 db_save_user_message(u["id"], task_id, msg.message_id, u["telegram_id"])
                 sent += 1
             except Exception as e:
-                print(f"[BOT] nie wysłano do {u['telegram_id']}: {e}")
+                print(f"[BOT] nie wysłano do {u['telegram_id']}: {e}", flush=True)
         return sent
 
 
 # ═══════════════════════════════════════════════════════════
-#  API (Flask)
+#  API
 # ═══════════════════════════════════════════════════════════
 
 bot = BotRunner(BOT_TOKEN)
@@ -532,15 +536,20 @@ def send():
 #  START
 # ═══════════════════════════════════════════════════════════
 
+print("=== START SERVER.PY ===", flush=True)
+
 try:
     init_db()
-    print("[OK] Baza zainicjalizowana.")
+    print("[OK] Baza zainicjalizowana.", flush=True)
 except Exception as e:
-    print(f"[DB INIT ERR] {e}")
+    print(f"[DB INIT ERR] {e}", flush=True)
 
-# Start bota w tle (razem z Flask)
+print(f"[..] BOT_TOKEN długość: {len(BOT_TOKEN)}, początek: {BOT_TOKEN[:8]}...", flush=True)
+print(f"[..] DATABASE_URL początek: {DATABASE_URL[:25]}...", flush=True)
+
+print("[..] Startuję wątek bota...", flush=True)
 bot.start_in_thread()
-print("[OK] Bot startuje w tle...")
+print("[OK] Wątek bota uruchomiony.", flush=True)
 
 
 if __name__ == "__main__":
